@@ -1,0 +1,1445 @@
+<!DOCTYPE html>
+<html lang="uz"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: the comment bubble itself (a 24px white teardrop,
+  // tail tip bottom-left = the hotspot), drawn by the browser so it has no
+  // lag; the host paints only the inspector box and, on click, the pin.
+  // Same glyph as the host's pins (size-6 rounded-full rounded-bl-[2px]);
+  // cursor images take no CSS shadow, so a slightly stronger 1px ring
+  // stands in for ring + shadow. SVG first (rasterised at device scale
+  // where supported), the same glyph as a 24px PNG for engines without
+  // SVG cursors (WebKit), then the arrow.
+  var BUBBLE_SVG =
+    "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>" +
+    "<path d='M12 .5h0A11.5 11.5 0 0 1 23.5 12v0A11.5 11.5 0 0 1 12 23.5H2.5a2 2 0 0 1-2-2V12A11.5 11.5 0 0 1 12 .5Z' fill='#fff' stroke='rgba(0,0,0,0.22)' stroke-width='1'/>" +
+    "</svg>";
+  var BUBBLE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC";
+  var BUBBLE_CURSOR =
+    "url(\"data:image/svg+xml," + encodeURIComponent(BUBBLE_SVG) + "\") 1 23, " +
+    "url(\"" + BUBBLE_PNG + "\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "064442e3-6478-4e96-a95c-69cd63b86596" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>USTA OSHPAZ — Haqiqiy osh, haqiqiy oshpazdan</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&amp;family=Inter:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0b09;--card:#17130f;--card2:#1e1812;--line:#2e251a;--gold:#f7b733;--gold2:#ffd36a;--text:#f4ede2;--mute:#a89b88;--serif:'Playfair Display',Georgia,serif;--sans:'Inter',system-ui,sans-serif;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-behavior:smooth;scroll-padding-top:80px;background:var(--bg)}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:radial-gradient(1000px 500px at 80% -5%,#3a1f0a55,transparent),var(--bg);color:var(--text);font-family:var(--sans);line-height:1.5}
+a{color:inherit;text-decoration:none}
+.w{max-width:1120px;margin:0 auto;padding:0 20px}
+section{padding:64px 0}
+h1,h2,h3{font-family:var(--serif);margin:0}
+h2{font-size:clamp(28px,4vw,40px)}
+.sub{color:var(--mute);margin:6px 0 28px}
+.gold{color:var(--gold)}
+.btn{display:inline-flex;align-items:center;gap:8px;border:0;cursor:pointer;font:600 15px var(--sans);padding:13px 24px;border-radius:12px;background:linear-gradient(180deg,var(--gold2),var(--gold));color:#2a1a00}
+.btn.o{background:transparent;color:var(--text);border:1px solid #5a4727}
+.btn.s{padding:8px 14px;font-size:13px;border-radius:9px;width:100%;justify-content:space-between}
+.btn:active{transform:scale(.98)}
+/* nav */
+nav{position:sticky;top:0;z-index:50;background:#0d0b09ee;backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top,0px)}
+nav .w{display:flex;align-items:center;gap:20px;height:64px}
+.logo{display:flex;align-items:center;gap:10px;font:700 17px var(--serif);letter-spacing:.5px}
+.logo i{font-style:normal;font-size:26px}
+.logo small{display:block;font:400 10px var(--sans);color:var(--mute);letter-spacing:0}
+.links{display:flex;gap:18px;margin-left:auto;font-size:13px}
+.links a{color:var(--mute);padding:4px 0;border-bottom:2px solid transparent}
+.links a:hover,.links a.on{color:var(--gold);border-color:var(--gold)}
+.tel{border:1px solid #5a4727;padding:8px 14px;border-radius:99px;font-size:13px;white-space:nowrap}
+.cart{position:relative;font-size:20px;background:none;border:0;color:var(--text);cursor:pointer}
+.cart b{position:absolute;top:-6px;right:-8px;background:var(--gold);color:#2a1a00;font-size:11px;border-radius:99px;min-width:17px;height:17px;display:grid;place-items:center}
+.burger{display:none;background:none;border:0;color:var(--text);font-size:26px;margin-left:auto;cursor:pointer}
+/* hero */
+.hero{padding:56px 0 0;background:radial-gradient(600px 400px at 75% 60%,#ff7a1a40,transparent)}
+.hero .w{display:grid;grid-template-columns:1.1fr 1fr;gap:20px;align-items:center}
+.tag{color:var(--gold);font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase}
+.hero h1{font-size:clamp(38px,6vw,64px);line-height:1.1;margin:12px 0}
+.hero p{font-size:18px;color:#d9cfc0;max-width:460px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:24px}
+.pot{font-size:min(36vw,230px);text-align:center;filter:drop-shadow(0 20px 40px #ff7a1a66);animation:fl 5s ease-in-out infinite}
+@keyframes fl{50%{transform:translateY(-10px)}}
+.feats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:40px;padding:18px 0;border-top:1px solid var(--line)}
+.feats div{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--mute)}
+.feats em{font-style:normal;font-size:24px;width:42px;height:42px;display:grid;place-items:center;border:1px solid #5a4727;border-radius:50%}
+.feats b{display:block;color:var(--text)}
+/* chef */
+.chef{display:grid;grid-template-columns:1.2fr 1fr .6fr;gap:20px;align-items:center}
+.chef p{color:#d9cfc0}
+.sig{font:italic 28px var(--serif);color:var(--mute);margin-top:12px}
+.cheff{font-size:150px;text-align:center}
+.stats{display:grid;gap:12px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;text-align:center}
+.stat b{display:block;font:700 28px var(--serif)}
+.stat span{font-size:13px;color:var(--mute)}
+.band{background:linear-gradient(120deg,#2a1608,#120d08);border:1px solid var(--line);border-radius:22px;padding:44px;display:grid;grid-template-columns:1.3fr 1fr;gap:24px;align-items:center;margin-top:40px}
+.band h3{white-space:pre-line;font-size:clamp(24px,3.5vw,34px);margin-bottom:20px}
+.band ul{list-style:none;margin:0;padding:0;display:grid;gap:12px}
+.band li{display:flex;gap:12px;align-items:center}
+.band li em{font-style:normal;width:34px;height:34px;display:grid;place-items:center;border:1px solid #5a4727;border-radius:10px;color:var(--gold)}
+/* menu */
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+.tab{background:var(--card);border:1px solid var(--line);color:var(--mute);padding:8px 16px;border-radius:99px;font:500 13px var(--sans);cursor:pointer}
+.tab.on{background:var(--gold);color:#2a1a00;border-color:var(--gold)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;display:flex;flex-direction:column;transition:.2s}
+.card:hover{transform:translateY(-4px);border-color:#5a4727}
+.pic{height:150px;display:grid;place-items:center;font-size:76px;background:radial-gradient(circle at 50% 60%,#ff9d3a55,#1a120a)}
+.card .b{padding:14px;display:flex;flex-direction:column;gap:6px;flex:1}
+.card h3{font-size:19px}
+.card small{color:var(--mute);font-size:12px;flex:1}
+.price{font-weight:600;font-size:15px}
+.more{justify-content:center;text-align:center;padding:20px;gap:14px;background:linear-gradient(160deg,#2a1608,var(--card))}
+/* gallery */
+.gal{columns:4 200px;column-gap:12px}
+.gal div{break-inside:avoid;margin-bottom:12px;border-radius:14px;display:grid;place-items:center;font-size:64px;position:relative;border:1px solid var(--line)}
+.gal span{position:absolute;left:10px;bottom:8px;font-size:12px;color:var(--text);background:#000a;padding:2px 9px;border-radius:99px}
+/* bonus */
+.bonus{background:linear-gradient(135deg,#241407,var(--card));border:1px solid var(--line);border-radius:22px;padding:32px}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.step{border:1px solid #5a4727;border-radius:14px;padding:18px;text-align:center;font-size:14px}
+.step em{display:block;font-style:normal;font-size:34px}
+.step b{color:var(--gold)}
+.track{display:flex;align-items:center;margin:26px 0 8px;gap:0}
+.track i{width:26px;height:26px;border-radius:50%;border:2px solid var(--gold);display:grid;place-items:center;font:600 11px var(--sans);font-style:normal;background:var(--bg);flex:none}
+.track i.f{background:var(--gold);color:#2a1a00}
+.track u{flex:1;height:2px;background:#5a4727}
+.track .gift{font-size:34px;margin-left:8px}
+/* reviews */
+.rv{display:flex;align-items:center;gap:10px}
+.rv .arrow{background:var(--card);border:1px solid var(--line);color:var(--text);width:38px;height:38px;border-radius:50%;cursor:pointer;flex:none}
+.rt{display:flex;gap:14px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;flex:1}
+.rt::-webkit-scrollbar{display:none}
+.r{min-width:min(280px,80%);flex:1;scroll-snap-align:start;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;font-size:14px;color:#d9cfc0}
+.r h4{margin:0 0 4px;color:var(--text);display:flex;align-items:center;gap:10px;font-size:15px}
+.av{width:36px;height:36px;border-radius:50%;background:var(--gold);color:#2a1a00;display:grid;place-items:center;font-weight:700}
+.st{color:var(--gold);letter-spacing:2px;font-size:13px;margin-bottom:8px}
+/* order */
+.order{display:grid;grid-template-columns:1.3fr 1fr;border:1px solid var(--line);border-radius:22px;overflow:hidden;background:var(--card)}
+form{padding:28px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+label{font-size:12px;color:var(--mute);display:grid;gap:5px}
+input,select,textarea{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px;color:var(--text);font:15px var(--sans);width:100%}
+input:focus,select:focus{outline:2px solid var(--gold);outline-offset:0}
+form .full{grid-column:1/-1}
+.side{background:linear-gradient(160deg,#3a1f0a,#14100b);padding:28px;display:flex;flex-direction:column;justify-content:center;gap:14px}
+.side h3{font-size:24px}
+.side p{margin:0;display:flex;gap:10px;align-items:center;color:#d9cfc0}
+.ok{display:none;grid-column:1/-1;background:#1c3a1c;border:1px solid #2f6b2f;color:#bff0bf;padding:14px;border-radius:10px}
+.pic{overflow:hidden}.pic img,.gal img,.gal video{width:100%;height:100%;object-fit:cover;display:block}.gal div{overflow:hidden}.row button.u{background:var(--card2);color:var(--text)}
+#adm{display:none;position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:90;box-shadow:0 6px 24px #000a}
+#ap{display:none;position:fixed;inset:0;z-index:100;background:var(--bg);overflow:auto;padding:20px}
+#ap .in{max-width:780px;margin:0 auto;display:grid;gap:10px}
+#ap h3{color:var(--gold);margin-top:18px}
+#ap .bar{position:sticky;top:0;background:var(--bg);padding:10px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;z-index:2}
+.row{display:flex;flex-wrap:wrap;gap:6px}.row input{flex:1 1 110px}
+.row button{background:#3a1a1a;color:#ffb4b4;border:0;border-radius:10px;padding:0 14px;cursor:pointer}
+footer{border-top:1px solid var(--line);padding:28px 0;color:var(--mute);font-size:13px;text-align:center}
+@media(max-width:860px){
+.links,.tel{display:none}.burger{display:block}
+.links.open{display:flex;flex-direction:column;position:absolute;top:100%;left:0;right:0;background:#0d0b09;padding:16px 20px;border-bottom:1px solid var(--line);gap:14px;margin:0}
+.hero .w,.chef,.band,.order{grid-template-columns:1fr}
+.feats{grid-template-columns:1fr 1fr}.steps{grid-template-columns:1fr}
+.band{padding:26px}form{grid-template-columns:1fr}.cart{margin-left:0}
+.cheff{font-size:110px}.stats{grid-template-columns:repeat(3,1fr)}
+}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<nav><div class="w">
+<a class="logo" href="#top"><i>👨‍🍳</i><span><b data-t="brand">USTA OSHPAZ</b><small data-t="tagline">Haqiqiy ta'm, haqiqiy osh</small></span></a>
+<div class="links" id="links">
+<a href="#top" class="on">Bosh sahifa</a><a href="#oshpaz">Oshpaz</a><a href="#menyu">Menyu</a><a href="#galereya">Galereya</a><a href="#fikr">Mijozlar fikri</a><a href="#bonus">Bonus</a><a href="#buyurtma">Buyurtma</a>
+</div>
+<a class="tel" id="tel" href="tel:+998901234567">📞 <span data-t="phone">+998 90 123 45 67</span></a>
+<button class="cart" aria-label="Savat" onclick="location.hash='buyurtma'">🛒<b id="cnt">0</b></button>
+<button class="burger" id="bg" aria-label="Menyu">☰</button>
+</div></nav>
+
+<header class="hero" id="top"><div class="w">
+<div>
+<div class="tag" data-t="heroTag">Tajribali oshpaz</div>
+<h1><span data-t="heroA">Haqiqiy osh —</span> <span class="gold" data-t="heroB">haqiqiy oshpazdan!</span></h1>
+<p data-t="heroText">Har kuni yangi, xushbo'y va to'yimli osh. Sizning rohatingiz — bizning maqsadimiz!</p>
+<div class="cta"><a class="btn" href="#buyurtma">Oshga buyurtma berish →</a><a class="btn o" href="#menyu">Menyuni ko'rish →</a><a class="btn o tg" target="_blank" rel="noopener noreferrer">✈️ Telegram bot</a><a class="btn o ig" target="_blank" rel="noopener noreferrer">📸 Instagram</a></div>
+</div>
+<div class="pot" aria-hidden="true">🍛</div>
+</div>
+<div class="w feats">
+<div><em>🌿</em><span><b>100% Tabiiy</b>mahsulotlar</span></div>
+<div><em>👨‍🍳</em><span><b>Tajriba</b>15+ yil</span></div>
+<div><em>🚚</em><span><b>Tez yetkazib</b>berish</span></div>
+<div><em>😊</em><span><b>Mijozlar</b>ishonchi</span></div>
+</div></header>
+
+<section id="oshpaz"><div class="w">
+<div class="chef">
+<div><h2>Oshpazimiz</h2><p><b data-t="chef">Usta Anzor</b> — oshning o'ziga xos ta'mini yaratadigan oshpaz.</p>
+<p data-t="chefText">15 yildan ortiq tajriba, milliy oshxona sirlarini avloddan avlodga o'tkazgan ustaning mahorati har bir taomda seziladi. U faqat taom emas, balki mehr bilan osh tayyorlaydi.</p><div class="sig" data-t="chef">Usta Anzor</div></div>
+<div class="cheff" aria-hidden="true">🧑‍🍳</div>
+<div class="stats"><div class="stat"><b class="gold" data-t="stat1">15+</b><span>yillik tajriba</span></div><div class="stat"><b class="gold" data-t="stat2">1000+</b><span>mamnun mijoz</span></div><div class="stat"><b class="gold">🍛</b><span>Mashhur taom: Palov</span></div></div>
+</div>
+<div class="band">
+<div><h3 data-t="band"></h3><a class="btn" href="#buyurtma">HOZIR BUYURTMA BERISH →</a></div>
+<ul><li><em>🥩</em>Go'sht</li><li><em>🌿</em>Sabzi</li><li><em>🍚</em>Guruch</li><li><em>🧅</em>Ziravorlar</li><li><em>♨️</em>Bug'</li><li><em>⭐</em>Ta'm</li></ul>
+</div>
+<div id="vid" style="display:none;margin-top:20px"></div>
+</div></section>
+
+<section id="menyu"><div class="w">
+<h2>Menyu</h2><p class="sub">Ta'm va sifat — bizning kafolatimiz!</p>
+<div class="tabs" id="tabs"></div>
+<div class="grid" id="menu"></div>
+</div></section>
+
+<section id="galereya"><div class="w">
+<h2>Galereya</h2><p class="sub">Bizning oshimiz — bizning faxrimiz!</p>
+<div class="tabs" id="gtabs"></div>
+<div class="gal" id="gal"></div>
+</div></section>
+
+<section id="bonus"><div class="w"><div class="bonus">
+<h2>Bonus tizimi</h2><p class="sub">Ko'proq buyurtma — ko'proq bonus!</p>
+<div class="steps" id="steps"></div>
+<div class="track" id="track"></div>
+<p class="sub" style="margin:0">Sizning bonusingiz: <b class="gold" id="bn">0</b> / 6</p>
+<div class="cta"><button class="btn o" onclick="bonus(1)">Bonusni tekshirish →</button></div>
+</div></div></section>
+
+<section id="fikr"><div class="w">
+<h2>Mijozlar fikri</h2><p class="sub">Sizning mamnunligingiz — bizning eng katta mukofotimiz!</p>
+<div class="rv"><button class="arrow" onclick="sc(-1)" aria-label="Oldingi">‹</button>
+<div class="rt" id="rt"></div>
+<button class="arrow" onclick="sc(1)" aria-label="Keyingi">›</button></div>
+</div></section>
+
+<section id="buyurtma"><div class="w">
+<h2>Buyurtma berish</h2><p class="sub">Tez va qulay buyurtma qiling!</p>
+<div class="order">
+<form id="f">
+<label>Ismingiz *<input name="n" required="" placeholder="Ism familya"></label>
+<label>Telefon raqami *<input name="p" required="" type="tel" placeholder="+998 90 123 45 67"></label>
+<label>Taom<select name="t" id="ts"></select></label>
+<label>Porsiya *<input name="q" type="number" min="1" value="1" required=""></label>
+<label class="full">Manzil *<input name="a" required="" placeholder="Manzilni kiriting"></label>
+<label class="full">Qo'shimcha izoh<input name="c" placeholder="Masalan: 2 ta non qo'shing"></label>
+<div class="ok" id="ok" role="status"></div>
+<button class="btn full" style="justify-content:center">Buyurtma berish ➤</button>
+</form>
+<div class="side"><h3>Buyurtmangiz tez va xavfsiz yetkaziladi!</h3>
+<p>🕒 O'z vaqtida</p><p>🛡️ Sifat kafolati</p><p>🔒 Xavfsiz to'lov</p></div>
+</div>
+</div></section>
+
+<footer><div class="w" data-t="footer">© 2026 USTA OSHPAZ · Haqiqiy ta'm, haqiqiy osh · 📞 +998 90 123 45 67</div><div class="w" style="margin-top:14px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap"><a class="btn o s tg" style="width:auto" target="_blank" rel="noopener noreferrer">✈️ Telegram bot</a><a class="btn o s ig" style="width:auto" target="_blank" rel="noopener noreferrer">📸 Instagram</a></div></footer>
+
+<input type="file" id="fi" hidden="">
+<button id="adm" class="btn" onclick="openA()">⚙️ Admin</button>
+<div id="ap" role="dialog" aria-label="Admin panel"><div class="in" id="ain"></div></div>
+<script id="data" type="application/json">{"t":{"brand":"USTA OSHPAZ","tagline":"Haqiqiy ta'm, haqiqiy osh","phone":"+998 954447838","heroTag":"Tajribali oshpaz","heroA":"Haqiqiy osh —","heroB":"haqiqiy oshpazdan!","heroText":"Har kuni yangi, xushbo'y va to'yimli osh. Sizning rohatingiz — bizning maqsadimiz!","chef":"Usta Anzor","chefText":"15 yildan ortiq tajriba, milliy oshxona sirlarini avloddan avlodga o'tkazgan ustaning mahorati har bir taomda seziladi. U faqat taom emas, balki mehr bilan osh tayyorlaydi.","stat1":"15+","stat2":"1000+","band":"Bu shunchaki osh emas.\nBu — ustaning qo'lidan chiqqan osh.","footer":"© 2026 USTA OSHPAZ · Haqiqiy ta'm, haqiqiy osh · 📞 +998 954447838","tg":"https://t.me/anzorosh","ig":"https://www.instagram.com/anzuranvarov"},"menu":[["Osh","🍛","Asosiy taomlar","Mol go'shti, maxsus sabzi, lazer guruch",25000,""],["G'ijdivon shashlik","🍢","Kaboblar","Mol go'shti",55000,""],["qo'y kuskavoy","🍢","Kaboblar","Qo'y go'shti",80000,""],["Umakay Jiz","🍛","Asosiy taom","Qo'y go'shti",270000,""],["Jiz","🍛","Asosiy taom","Qo'y go'shti",230000,""]],"rev":[["Azizbek T.","'Osh juda mazali, go'shti yumshoq, porsiyasi ham yaxshi ekan. Albatta yana buyurtma beraman!'"],["Dilshoda A.","'Oshxonani endi topdik! Sifat va ta'm a'lo darajada. Tavsiya qilaman!'"],["Sanjar R.","'Oshpaz haqiqiy usta ekan. Ta'mi bilib qoladi. Rahmat!'"],["Mohira S.","'O'ziga xos ta'm, toza va sifatli mahsulotlar. Juda mamnun bo'ldik!'"],["Temur R.","'Oshpaz haqiqiy usta ekan. Ta'mi bilib qoladi. Rahmat!'"]],"gal":[["🍛","Taomlar","",""],["🧑‍🍳","Jarayon","",""],["🍢","Taomlar","",""],["🏮","Restoran","",""],["🔥","Jarayon","",""],["🍽️","Restoran","",""],["🥗","Taomlar","",""],["😊","Mijozlar","",""]],"steps":["5 marta osh oling — 6-osh bizdan!","Do'stingizni olib keling — 10% bonus oling!","Tug'ilgan kuningizda — maxsus chegirma!"],"video":"","pw":"3b1d6867731fd3767333e29e0b2c7cfd2caa0315c0fdfcf57e742d670b5af60b"}</script>
+<script>
+const SRC='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=n=>Number(n).toLocaleString('ru-RU')+" so'm";
+let D=JSON.parse($('#data').textContent),cur='Barchasi',gcur='Barchasi',cart=0,bn=0;
+const IC=["🎁","👥","🎂"],COL=["#7a3b0d","#3d2410","#5a1f10","#4a2d10","#6b2a0a","#2f2316","#2d4a1a","#4a3320"],HT=[190,150,170,140,150,180,150,170];
+D.t.tg=D.t.tg||'https://t.me/';D.t.ig=D.t.ig||'https://www.instagram.com/';D.video=D.video||'';D.pw=D.pw||'';D.menu.forEach(m=>m[5]=m[5]||'');D.gal.forEach(g=>{g[2]=g[2]||'';g[3]=g[3]||''});
+const TL={brand:"Sayt nomi",tagline:"Shior",phone:"Telefon raqami",heroTag:"Bosh sahifa yorlig'i",heroA:"Sarlavha (1-qism)",heroB:"Sarlavha (2-qism, oltin rang)",heroText:"Bosh sahifa matni",chef:"Oshpaz ismi",chefText:"Oshpaz haqida matn",stat1:"Tajriba (masalan 15+)",stat2:"Mijozlar soni",band:"Katta shior",footer:"Pastki yozuv",tg:"Telegram bot havolasi (https://t.me/...)",ig:"Instagram havolasi (https://instagram.com/...)"};
+const TB={menu:["Nomi","Emoji","Kategoriya","Tavsif","Narx (so'm)"],rev:["Ism","Fikr"],gal:["Emoji","Kategoriya"]};
+function tabs(el,list,c,cb){el.innerHTML=list.map(x=>`<button class="tab${x==c?' on':''}">${esc(x)}</button>`).join('');el.onclick=e=>{const b=e.target.closest('.tab');if(b){cb(b.textContent);render()}}}
+function render(){
+document.querySelectorAll('[data-t]').forEach(e=>e.textContent=D.t[e.dataset.t]);
+$('#tel').href='tel:'+D.t.phone.replace(/[^+\d]/g,'');document.title=D.t.brand+' — '+D.t.tagline;
+const mc=['Barchasi',...new Set(D.menu.map(m=>m[2]))];if(!mc.includes(cur))cur='Barchasi';tabs($('#tabs'),mc,cur,c=>cur=c);
+$('#menu').innerHTML=D.menu.filter(m=>cur=='Barchasi'||m[2]==cur).map(m=>`<div class="card"><div class="pic">${m[5]?`<img src="${U(m[5])}" alt="${esc(m[0])}" loading="lazy">`:esc(m[1])}</div><div class="b"><h3>${esc(m[0])}</h3><small>${esc(m[3])}</small><div class="price">${fmt(m[4])}</div><button class="btn s" data-n="${esc(m[0])}">Buyurtma berish <span>→</span></button></div></div>`).join('')+(cur=='Barchasi'?`<div class="card more"><h3>Bundan ham ko'proq taomlar bizda!</h3><a class="btn o s" href="#buyurtma" style="justify-content:center">To'liq menyuni so'rash</a></div>`:'');
+const sv=$('#ts').value;$('#ts').innerHTML=D.menu.map(m=>`<option>${esc(m[0])}</option>`).join('');if(D.menu.some(m=>m[0]==sv))$('#ts').value=sv;
+const gc=['Barchasi',...new Set(D.gal.map(g=>g[1]))];if(!gc.includes(gcur))gcur='Barchasi';tabs($('#gtabs'),gc,gcur,c=>gcur=c);
+$('#gal').innerHTML=D.gal.map((g,i)=>[g,i]).filter(([g])=>gcur=='Barchasi'||g[1]==gcur).map(([g,i])=>`<div style="height:${HT[i%8]}px;background:radial-gradient(circle at 50% 40%,${COL[i%8]},#120d08)">${g[2]?(g[3]=='v'?`<video src="${U(g[2])}" controls muted playsinline preload="metadata"></video>`:`<img src="${U(g[2])}" alt="" loading="lazy">`):esc(g[0])}<span>${esc(g[1])}</span></div>`).join('');
+$('#rt').innerHTML=D.rev.map(r=>`<div class="r"><h4><span class="av">${esc(r[0][0]||'?')}</span>${esc(r[0])}</h4><div class="st">★★★★★</div>${esc(r[1])}</div>`).join('');
+if($('#vid').dataset.v!==D.video){$('#vid').dataset.v=D.video;$('#vid').style.display=D.video?'block':'none';$('#vid').innerHTML=D.video?`<video src="${U(D.video)}" controls playsinline preload="metadata" style="width:100%;max-height:520px;border-radius:18px;background:#000"></video>`:''}
+['tg','ig'].forEach(k=>document.querySelectorAll('.'+k).forEach(a=>{a.href=D.t[k];a.style.display=/^https?:\/\/(www\.)?(t\.me|instagram\.com)\/?$/.test(D.t[k].trim())?'none':''}));
+$('#steps').innerHTML=D.steps.map((s,i)=>{const p=s.split(' — ');return `<div class="step"><em>${IC[i%3]}</em>${esc(p[0])}${p.length>1?` — <b>${esc(p.slice(1).join(' — '))}</b>`:''}</div>`}).join('')}
+$('#menu').onclick=e=>{const b=e.target.closest('[data-n]');if(b){cart++;$('#cnt').textContent=cart;$('#ts').value=b.dataset.n;location.hash='buyurtma'}};
+function sc(d){$('#rt').scrollBy({left:d*300,behavior:'smooth'})}
+function bonus(i){bn=(bn+i)%7;draw()}
+function draw(){let h='';for(let i=1;i<=6;i++)h+=`<i class="${i<=bn?'f':''}">${i}</i><u></u>`;$('#track').innerHTML=h+'<span class="gift">🎁</span>';$('#bn').textContent=bn}
+$('#bg').onclick=()=>$('#links').classList.toggle('open');
+$('#links').onclick=e=>{if(e.target.tagName=='A'){$('#links').classList.remove('open');document.querySelectorAll('#links a').forEach(a=>a.classList.toggle('on',a==e.target))}};
+$('#f').onsubmit=e=>{e.preventDefault();const d=new FormData(e.target),t=D.menu.find(m=>m[0]==d.get('t'))||D.menu[0],s=t[4]*d.get('q'),o=$('#ok');
+const msg=`Yangi buyurtma\nIsm: ${d.get('n')}\nTelefon: ${d.get('p')}\nTaom: ${t[0]} x${d.get('q')} (${fmt(s)})\nManzil: ${d.get('a')}\nIzoh: ${d.get('c')||'-'}`;
+const tg=D.t.tg.trim(),ok=!/^https?:\/\/(www\.)?t\.me\/?$/.test(tg);
+o.style.display='block';o.textContent=`Rahmat, ${d.get('n')}! ${d.get('q')} ta ${t[0]} (${fmt(s)}) buyurtmangiz tayyor.`+(ok?" Ochilgan Telegram oynasida «Yuborish» tugmasini bosing.":" Tez orada siz bilan bog'lanamiz.");
+if(ok){try{navigator.clipboard.writeText(msg)}catch(_){}window.open(tg+(tg.includes('?')?'&':'?')+'text='+encodeURIComponent(msg),'_blank','noopener')}
+e.target.reset();cart=0;$('#cnt').textContent=0;bn=Math.min(bn+1,6);draw()};
+/* admin */
+function tbl(k,t){const n=TB[k].length,mi=k=='menu'?5:2;return `<h3>${t}</h3>`+D[k].map((r,i)=>`<div class="row">${r.slice(0,n).map((v,j)=>`<input data-a="${k}" data-i="${i}" data-j="${j}" placeholder="${TB[k][j]}" value="${esc(v)}">`).join('')}${k!='rev'?`<button type="button" class="u" data-up="${k}:${i}">${r[mi]?'✓ ':''}${k=='menu'?'📷 Rasm':'🖼/🎬 Fayl'}</button>${r[mi]?`<button type="button" data-clr="${k}:${i}">Faylni olib tashlash</button>`:''}`:''}<button type="button" data-del="${k}:${i}" aria-label="O'chirish">✕</button></div>`).join('')+`<button type="button" class="btn o s" style="width:auto" data-add="${k}">+ Qo'shish</button>`}
+function panel(){$('#ain').innerHTML=`<div class="bar"><button class="btn" id="sv">Saqlash va e'lon qilish</button><button class="btn o" id="cl">Yopish</button><span id="am">${esc(note)}</span></div><h2>Admin panel</h2>`+Object.keys(TL).map(k=>`<label>${TL[k]}<textarea data-k="${k}" rows="${D.t[k].length>60?3:1}">${esc(D.t[k])}</textarea></label>`).join('')+tbl('menu','Menyu')+tbl('gal','Galereya')+tbl('rev','Mijozlar fikri')+'<h3>Asosiy video</h3><div class="row"><button type="button" class="u" data-upv>🎬 Video yuklash</button>'+(D.video?'<button type="button" data-delv>Videoni olib tashlash</button>':'')+'</div><h3>Bonus qadamlari</h3>'+D.steps.map((s,i)=>`<label>${i+1}-qadam (" — " dan keyingi qism qalin chiqadi)<input data-s="${i}" value="${esc(s)}"></label>`).join('')}
+function openA(){panel();$('#ap').style.display='block'}
+let note='';const am=m=>{note=m;if($('#am'))$('#am').textContent=m};
+function pick(a){return new Promise(r=>{const i=$('#fi');i.accept=a;i.value='';i.onchange=()=>r(i.files[0]||null);i.click()})}
+const U=v=>esc(String(v).startsWith('data:')?v:'/_blob/'+v);
+function rimg(f){return new Promise((ok,no)=>{const u=URL.createObjectURL(f),im=new Image();im.onload=()=>{const k=Math.min(1,900/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=Math.round(im.width*k);c.height=Math.round(im.height*k);const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,0,0,c.width,c.height);URL.revokeObjectURL(u);ok(c.toDataURL('image/jpeg',.82))};im.onerror=()=>no('rasm o\'qilmadi');im.src=u})}
+function rvid(f){return new Promise((ok,no)=>{if(f.size>6e6)return no('Video 6 MB dan oshmasin');const r=new FileReader();r.onload=()=>ok(r.result);r.onerror=()=>no('video o\'qilmadi');r.readAsDataURL(f)})}
+async function upl(f){am('Yuklanmoqda…');try{const v=f.type.startsWith('video')?await rvid(f):await rimg(f);am('Tayyor ✓ — endi «Saqlash» ni bosing');return v}catch(e){am('Yuklanmadi: '+(typeof e=='string'?e:'xato'));return null}}
+$('#ain').addEventListener('input',e=>{const t=e.target;if(t.dataset.k)D.t[t.dataset.k]=t.value;else if(t.dataset.s)D.steps[t.dataset.s]=t.value;else if(t.dataset.a){const k=t.dataset.a;D[k][t.dataset.i][t.dataset.j]=(k=='menu'&&t.dataset.j==4)?(Number(t.value)||0):t.value}render()});
+$('#ain').addEventListener('click',async e=>{const t=e.target;
+if(t.id=='cl'){$('#ap').style.display='none';return}
+if(t.dataset.up){const[k,i]=t.dataset.up.split(':');const f=await pick(k=='menu'?'image/*':'image/*,video/*');if(!f)return;const id=await upl(f);if(!id)return;if(k=='menu')D.menu[i][5]=id;else{D.gal[i][2]=id;D.gal[i][3]=f.type.startsWith('video')?'v':'i'}panel();render();return}
+if(t.dataset.clr){const[k,i]=t.dataset.clr.split(':');D[k][i][k=='menu'?5:2]='';panel();render();return}
+if('upv' in t.dataset){const f=await pick('video/*');if(!f)return;const id=await upl(f);if(id){D.video=id;panel();render()}return}
+if('delv' in t.dataset){D.video='';panel();render();return}
+if(t.dataset.add){const a=t.dataset.add;D[a].push(a=='menu'?['','','','',0,'']:a=='gal'?['','','','']:['','']);panel();render();return}
+if(t.dataset.del){const[k,i]=t.dataset.del.split(':');D[k].splice(i,1);panel();render();return}
+if(t.id=='sv'){am('Saqlanmoqda…');try{let a=null;try{a=await claude.use('artifact')}catch(_){}
+const j=JSON.stringify(D).replace(/</g,'\\u003c');if(j.length>14e6){am('Fayllar juda katta (14 MB dan oshdi). Ba\'zilarini olib tashlang');return}
+const H=(SRC.replace(/(<script id="data" type="application\/json">)[\s\S]*?(<\/script>)/,(m,x,y)=>x+j+y));if(a)await a.publish(H);else{dl(H);am('index.html yuklab olindi — uni hostingga qayta yuklang')}}catch(err){am(err&&err.code=='conflict'?'Boshqa o\'zgarish bor, sahifa yangilanadi':'Xatolik: '+((err&&err.code)||'saqlanmadi'))}}});
+render();draw();
+
+function dl(h){const b=new Blob([h],{type:'text/html'}),l=document.createElement('a');l.href=URL.createObjectURL(b);l.download='index.html';document.body.appendChild(l);l.click();l.remove()}
+async function hsh(p){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('usta:'+p));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+function lock(){const nw=!D.pw;$('#ain').innerHTML=`<div class="bar"><button class="btn o" id="cl">Yopish</button></div><h2>${nw?"Yangi parol o'rnating":'Admin paroli'}</h2><input id="pw" type="password" placeholder="${nw?'Kamida 6 belgi':'Parol'}" autocomplete="off"><button class="btn" id="pk" style="justify-content:center">${nw?"O'rnatish":'Kirish'}</button><p id="pm" class="sub"></p>`;$('#ap').style.display='block'}
+async function gate(){if(location.hash==='#admin')lock()}
+document.addEventListener('click',async e=>{if(e.target.id!='pk')return;const v=$('#pw').value,m=$('#pm');try{if(!D.pw){if(v.length<6){m.textContent='Kamida 6 belgi kiriting';return}D.pw=await hsh(v);am("Parol o'rnatildi. «Saqlash» ni bosing: fayl yuklab olinadi, uni hostingga qayta yuklang.");openA()}else if(await hsh(v)===D.pw)openA();else m.textContent="Parol noto'g'ri"}catch(err){m.textContent="Bu brauzerda ishlamadi. Chrome'da oching."}});
+let tp=0,tt;$('.logo').addEventListener('click',()=>{tp++;clearTimeout(tt);tt=setTimeout(()=>tp=0,3000);if(tp>=5){tp=0;lock()}});
+gate();addEventListener('hashchange',gate);
+try{claude.use('user').then(u=>{if(u&&u.isOwner())$('#adm').style.display='block'}).catch(()=>{})}catch(e){}
+</script></body></html>
